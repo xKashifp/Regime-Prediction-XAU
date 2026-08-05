@@ -1,0 +1,8 @@
+pandas==3.0.5
+numpy==2.4.5
+scikit-learn==1.9.0
+xgboost==3.3.0
+MetaTrader5==5.0.5735
+streamlit==1.60.0
+plotly==6.9.0
+Pillow==12.3.0
