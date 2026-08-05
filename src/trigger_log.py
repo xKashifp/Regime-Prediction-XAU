@@ -6,7 +6,8 @@ can be reconciled against actual times instead of just seeing "now."
 Mirrors get_position_state() exactly:
   - BURST_START/CONTINUE below BURST_LONG_MAGNITUDE_ATR -> TRIGGER IN
   - the moment magnitude crosses that threshold             -> TRIGGER OUT - LONG
-  - BURST_END                                                -> TRIGGER OUT - RANGING
+  - BURST_END, episode never reached LONG                    -> TRIGGER OUT - RANGING
+  - BURST_END, episode had reached LONG at some point         -> TRIGGER IN (faded)
 
 Timestamps are broker-server-time, printed literally (same convention as
 everything else derived from candles_m5/intraday_alerts -- matches what
@@ -47,8 +48,13 @@ def build_reconciliation_log() -> list:
                 already_long = True
                 rows.append({"ts": a["ts"], "label": f"Trigger out - LONG {a['direction']}", "price": a["price"]})
         elif a["event"] == "BURST_END":
+            # A burst can cool back below the LONG line before it's actually
+            # logged as ended, so whether this episode counts as "had gone
+            # LONG" comes from already_long (set the moment any row in this
+            # episode crossed the threshold), not this row's own magnitude.
+            label = f"Trigger in - {a['direction']} faded" if already_long else f"Trigger out - RANGING ({a['direction']} faded)"
             already_long = False
-            rows.append({"ts": a["ts"], "label": f"Trigger out - RANGING ({a['direction']} faded)", "price": a["price"]})
+            rows.append({"ts": a["ts"], "label": label, "price": a["price"]})
 
     return rows
 

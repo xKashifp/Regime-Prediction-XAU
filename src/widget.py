@@ -16,7 +16,8 @@ Run:
                                               realtime_loop/intraday_loop: a
                                               closed window respawns in ~5s)
 
-Drag anywhere on the panel to move it. Click the small x to close it.
+Drag anywhere on the panel to move it. Click the small _ to minimize it to
+the taskbar, or the x to close it.
 
 The old Streamlit dashboard (src/dashboard.py) is no longer auto-started --
 it's kept as an optional manual deep-dive (`streamlit run src/dashboard.py`)
@@ -140,19 +141,28 @@ def get_near_term_outlook():
 
 
 def get_burst_status():
-    """Returns {calm, direction, is_long, magnitude, detail, price} or None if intraday_loop hasn't produced data yet."""
+    """Returns {calm, direction, is_long, was_long, magnitude, detail, price}
+    or None if intraday_loop hasn't produced data yet. was_long only matters
+    while calm: whether the burst that just stopped had already reached the
+    LONG/extended tier (>= BURST_LONG_MAGNITUDE_ATR) before it stopped, vs.
+    fizzling out while still fresh -- used by get_position_state to tell
+    "a big move just ended" apart from "nothing was really happening"."""
     if not config.DB_PATH.exists():
         return None
     conn = sqlite3.connect(str(config.DB_PATH))
     last_candle = pd.read_sql_query("SELECT time, close FROM candles_m5 ORDER BY time DESC LIMIT 1", conn)
-    alerts = pd.read_sql_query("SELECT * FROM intraday_alerts ORDER BY ts DESC LIMIT 1", conn)
+    # LIMIT 50 gives plenty of headroom to scan a whole episode back to its
+    # BURST_START if the latest row is a BURST_END (see below) -- observed
+    # episodes top out around 18 rows, and this table stays small (~100 rows
+    # total), so this is a cheap query either way.
+    alerts = pd.read_sql_query("SELECT * FROM intraday_alerts ORDER BY ts DESC LIMIT 50", conn)
     conn.close()
     if last_candle.empty:
         return None
 
     price = float(last_candle.iloc[0]["close"])
     if alerts.empty:
-        return {"calm": True, "direction": None, "is_long": False, "magnitude": None, "detail": "No burst right now.", "price": price}
+        return {"calm": True, "direction": None, "is_long": False, "was_long": False, "magnitude": None, "detail": "No burst right now.", "price": price}
 
     last = alerts.iloc[0]
     # "now" here must be broker-server time, same clock domain as ts -- this
@@ -165,13 +175,35 @@ def get_burst_status():
     now_broker = pd.to_datetime(int(last_candle.iloc[0]["time"]), unit="s")
     age_min = (now_broker - pd.to_datetime(last["ts"], unit="s")).total_seconds() / 60
     if last["event"] == "BURST_END" or age_min > BURST_STALE_MINUTES:
+        # BURST_END rows are logged with magnitude_atr zeroed out (there's no
+        # "current" magnitude once a burst is over), so whether THIS episode
+        # ever reached the LONG tier has to come from the rows before it --
+        # walk back through its BURST_START/CONTINUE history and take the
+        # peak, not just the row right before END. A burst can cool back
+        # below the LONG line before it's actually logged as over (observed
+        # in practice: peaked at 5.5x ATR, faded to 4.7x, then ended), so
+        # checking only the last active row would wrongly call that a
+        # never-went-long fizzle. A burst that went stale without an explicit
+        # END has no such follow-up row, so `last` itself is already the last
+        # active reading and needs no walk-back.
+        if last["event"] == "BURST_END":
+            peak_magnitude = 0.0
+            for _, row in alerts.iloc[1:].iterrows():
+                if row["event"] not in ("BURST_START", "BURST_CONTINUE"):
+                    break  # ran past this episode's start into an earlier one
+                peak_magnitude = max(peak_magnitude, float(row["magnitude_atr"]) if pd.notna(row["magnitude_atr"]) else 0.0)
+                if row["event"] == "BURST_START":
+                    break
+        else:
+            peak_magnitude = float(last["magnitude_atr"]) if pd.notna(last["magnitude_atr"]) else 0.0
+        was_long = peak_magnitude >= config.BURST_LONG_MAGNITUDE_ATR
         detail = f"Last burst ({last['direction']}) ended {age_min:.0f} min ago." if last["event"] == "BURST_END" else "No burst right now."
-        return {"calm": True, "direction": None, "is_long": False, "magnitude": None, "detail": detail, "price": price}
+        return {"calm": True, "direction": last["direction"], "is_long": False, "was_long": was_long, "magnitude": None, "detail": detail, "price": price}
 
     magnitude = float(last["magnitude_atr"]) if pd.notna(last["magnitude_atr"]) else 0.0
     return {
         "calm": False, "direction": last["direction"],
-        "is_long": magnitude >= config.BURST_LONG_MAGNITUDE_ATR, "magnitude": magnitude,
+        "is_long": magnitude >= config.BURST_LONG_MAGNITUDE_ATR, "was_long": False, "magnitude": magnitude,
         "detail": last["note"] if pd.notna(last["note"]) else "", "price": price,
     }
 
@@ -222,6 +254,14 @@ def get_position_state():
     if burst is None:
         return {"text": "NO SIGNAL YET", "color": CALM_COLOR}
     if burst["calm"]:
+        if burst["was_long"]:
+            # The move that just stopped had already gone LONG/extended --
+            # that's the "get out, don't chase it" state fading back to
+            # normal, i.e. exactly the point this panel exists to flag as a
+            # fresh entry again (mirrors TRIGGER IN below for an active-but-
+            # not-yet-extended burst).
+            color = REGIME_COLOR.get(burst["direction"], CALM_COLOR)
+            return {"text": f"TRIGGER IN - {burst['direction'].upper()} FADED @ {burst['price']:,.2f}", "color": color}
         return {"text": "TRIGGER OUT - RANGING", "color": CALM_COLOR}
     color = REGIME_COLOR.get(burst["direction"], CALM_COLOR)
     if burst["is_long"]:
@@ -373,6 +413,21 @@ class Widget:
         self.close_btn.label.config(cursor="hand2")
         self.close_btn.label.bind("<Button-1>", lambda e: self.root.destroy())
 
+        # overrideredirect(True) windows have no OS-drawn minimize control and
+        # iconify() alone is a no-op for them on Windows -- the window just
+        # vanishes with no taskbar entry to bring it back. The fix is to drop
+        # overrideredirect right before iconifying (so Windows treats it as a
+        # normal window and gives it a taskbar entry), then reapply it once
+        # the taskbar click restores the window (caught via <Map>, since
+        # that's what fires on restore) so it goes back to borderless.
+        self._minimized = False
+        self.minimize_btn = BitmapLabel(self.root, 12, fg="#555")
+        self.minimize_btn.config(text="_")
+        self.minimize_btn.place(x=WIDTH - 46, y=8)
+        self.minimize_btn.label.config(cursor="hand2")
+        self.minimize_btn.label.bind("<Button-1>", lambda e: self._minimize())
+        self.root.bind("<Map>", self._on_map)
+
         self.price_lbl = BitmapLabel(self.root, 14, bold=True)
         self.price_lbl.place(x=14, y=8)
 
@@ -435,6 +490,17 @@ class Widget:
         x = self.root.winfo_x() + (event.x - self._drag["x"])
         y = self.root.winfo_y() + (event.y - self._drag["y"])
         self.root.geometry(f"+{x}+{y}")
+
+    def _minimize(self):
+        self._minimized = True
+        self.root.overrideredirect(False)
+        self.root.iconify()
+
+    def _on_map(self, event):
+        if self._minimized and self.root.state() == "normal":
+            self._minimized = False
+            self.root.overrideredirect(True)
+            self.root.attributes("-topmost", True)
 
     def refresh(self):
         try:
