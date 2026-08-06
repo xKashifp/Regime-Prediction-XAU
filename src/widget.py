@@ -8,7 +8,7 @@ disagree with DAILY TREND often, they're answering different questions on
 different horizons), BURST WATCH (5-minute detector, tagged LONG when it's a big hike >=
 config.BURST_LONG_MAGNITUDE_ATR, plus magnitude/note), POSITION (last
 long-term signal fired), and a RECENT log of the last few signals/burst
-events. Polls data/test.db directly, read-only, every few seconds.
+events. Polls the live Postgres DB directly, read-only, every few seconds.
 
 Run:
     python -m src.widget                     (standalone: closing it is final)
@@ -25,14 +25,14 @@ for the intraday chart, full signal history, and raw burst log this widget
 deliberately leaves out.
 """
 
-import sqlite3
 import time
 import tkinter as tk
 
 import pandas as pd
+import psycopg2
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-from . import config
+from . import config, db
 from .labeling import build_labels
 
 REGIME_COLOR = {"bullish": "#22c55e", "bearish": "#ef4444", "ranging": "#94a3b8"}
@@ -104,9 +104,10 @@ def get_daily_trend():
     """Returns {regime, confidence, price, age_sec} or None if no daily data yet.
     age_sec is seconds since the model last ran, both sides true UTC
     (time.time() vs regime_predictions.ts) -- same domain, safe to subtract."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return None
-    conn = sqlite3.connect(str(config.DB_PATH))
     daily = pd.read_sql_query("SELECT date, close FROM daily_bars ORDER BY date", conn, parse_dates=["date"])
     preds = pd.read_sql_query("SELECT * FROM regime_predictions ORDER BY ts", conn)
     conn.close()
@@ -138,9 +139,10 @@ def get_near_term_outlook():
     variant tried, and it ran bearish on 14/15 live calls -- 27% hit rate --
     straight through a sustained rally). Returns None if nothing's been
     produced yet (model not trained, or intraday_loop not running)."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return None
-    conn = sqlite3.connect(str(config.DB_PATH))
     row = pd.read_sql_query(
         "SELECT label, confidence, price FROM near_term_predictions ORDER BY ts DESC LIMIT 1", conn,
     )
@@ -182,9 +184,10 @@ def get_burst_status():
     since_ts (broker-server-time epoch, same domain as alerts.ts) is when the
     *current* position state began: the active episode's BURST_START while a
     burst is running, or the moment it ended/went stale while calm."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return None
-    conn = sqlite3.connect(str(config.DB_PATH))
     last_candle = pd.read_sql_query("SELECT time, close FROM candles_m5 ORDER BY time DESC LIMIT 1", conn)
     # LIMIT 50 gives plenty of headroom to scan a whole episode back to its
     # BURST_START if the latest row is a BURST_END (see below) -- observed
@@ -253,9 +256,10 @@ def get_live_bar():
     the HH:MM MT5's own terminal shows for this candle. Converting it to true
     UTC or this machine's local time first would make it *stop* matching
     what's on your MT5 screen, which defeats the point of showing it."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return None
-    conn = sqlite3.connect(str(config.DB_PATH))
     row = pd.read_sql_query(
         "SELECT time, open, high, low, close, tick_volume FROM candles_m5 ORDER BY time DESC LIMIT 1", conn,
     )
@@ -272,8 +276,8 @@ def get_live_bar():
 
 
 def get_position_state():
-    """Returns {text, color, since_text} for the position readout: TRIGGER IN
-    while a strong directional intraday burst is active, TRIGGER OUT the
+    """Returns {text, color, since_text} for the position readout: TRIGGER OUT
+    while a strong directional intraday burst is active, TRIGGER IN the
     moment it fades back to normal/ranging. Sourced directly from the same
     burst state as BURST WATCH (get_burst_status) -- NOT the daily swing
     model. That was the previous version of this panel (signals/
@@ -282,7 +286,10 @@ def get_position_state():
     middle of a huge rally -- a different question entirely from "is a
     strong move happening right now," which is what this panel is actually
     for. since_text is when the CURRENT state began (formatted, e.g.
-    "10:00 AM - 4AUG2026"), not just this refresh's timestamp."""
+    "10:00 AM - 4AUG2026"), not just this refresh's timestamp.
+
+    Display labels only (TRIGGER IN <-> TRIGGER OUT swapped 2026-08-06,
+    per request) -- the underlying state/color/thresholds are unchanged."""
     burst = get_burst_status()
     if burst is None:
         return {"text": "NO SIGNAL YET", "color": CALM_COLOR, "since_text": ""}
@@ -292,18 +299,18 @@ def get_position_state():
             # The move that just stopped had already gone LONG/extended --
             # that's the "get out, don't chase it" state fading back to
             # normal, i.e. exactly the point this panel exists to flag as a
-            # fresh entry again (mirrors TRIGGER IN below for an active-but-
+            # fresh entry again (mirrors TRIGGER OUT below for an active-but-
             # not-yet-extended burst).
             color = REGIME_COLOR.get(burst["direction"], CALM_COLOR)
-            return {"text": f"TRIGGER IN - {burst['direction'].upper()} FADED @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
-        return {"text": "TRIGGER OUT - RANGING", "color": CALM_COLOR, "since_text": since_text}
+            return {"text": f"TRIGGER OUT - {burst['direction'].upper()} FADED @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
+        return {"text": "TRIGGER IN - RANGING", "color": CALM_COLOR, "since_text": since_text}
     color = REGIME_COLOR.get(burst["direction"], CALM_COLOR)
     if burst["is_long"]:
         # Already a big/extended hike (>= BURST_LONG_MAGNITUDE_ATR) -- past
         # the point of a fresh entry. This is the "get out, don't chase it"
         # moment, not a signal to newly get in.
-        return {"text": f"TRIGGER OUT - LONG {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
-    return {"text": f"TRIGGER IN - {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
+        return {"text": f"TRIGGER IN - LONG {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
+    return {"text": f"TRIGGER OUT - {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
 
 
 def get_recent_log(limit=LOG_LIMIT):
@@ -321,12 +328,13 @@ def get_recent_log(limit=LOG_LIMIT):
     ORDER ONLY, alerts.ts is shifted into a true-UTC-equivalent using the live
     offset between those same two "now" values -- no extra MT5 call needed,
     both are already being read."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return []
-    conn = sqlite3.connect(str(config.DB_PATH))
-    sigs = pd.read_sql_query("SELECT ts, signal_type, price FROM signals ORDER BY ts DESC LIMIT ?", conn, params=(limit,))
+    sigs = pd.read_sql_query("SELECT ts, signal_type, price FROM signals ORDER BY ts DESC LIMIT %s", conn, params=(limit,))
     alerts = pd.read_sql_query(
-        "SELECT ts, event, direction, magnitude_atr, price FROM intraday_alerts ORDER BY ts DESC LIMIT ?",
+        "SELECT ts, event, direction, magnitude_atr, price FROM intraday_alerts ORDER BY ts DESC LIMIT %s",
         conn, params=(limit,),
     )
     last_candle = pd.read_sql_query("SELECT time FROM candles_m5 ORDER BY time DESC LIMIT 1", conn)

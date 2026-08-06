@@ -195,7 +195,7 @@ def run_once(booster, feature_cols, near_term_booster, near_term_feature_cols, l
 
     m5 = pd.read_sql_query(
         """SELECT time, open, high, low, close, tick_volume FROM candles_m5
-           ORDER BY time DESC LIMIT ?""",
+           ORDER BY time DESC LIMIT %s""",
         conn, params=(config.INTRADAY_MAX_BARS_LOADED,),
     )
     if len(m5) < 60:

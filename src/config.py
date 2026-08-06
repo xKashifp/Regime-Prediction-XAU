@@ -1,5 +1,6 @@
 """Central configuration for the regime detection + live monitoring system."""
 
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -7,8 +8,19 @@ ROOT = Path(__file__).resolve().parent.parent
 # --- paths ---
 PROCESSED_DIR = ROOT / "data" / "processed"
 REGIME_LABELS_CSV = PROCESSED_DIR / "regime_labels.csv"  # output only, for inspection -- never read back in
-DB_PATH = ROOT / "data" / "test.db"
 MODEL_PATH = ROOT / "models" / "xgb_regime.json"
+
+# --- database (PostgreSQL) ---
+# Credentials come from the environment, never hardcoded here -- this file is
+# committed to git. PG_HOST defaults to localhost because the live loops
+# (realtime_loop.py/intraday_loop.py) run on the same machine that hosts
+# Postgres; a dev machine connecting over the LAN sets PG_HOST to that
+# machine's LAN IP instead.
+PG_HOST = os.environ.get("PG_HOST", "localhost")
+PG_PORT = int(os.environ.get("PG_PORT", "5432"))
+PG_DBNAME = os.environ.get("PG_DBNAME", "regime_db")
+PG_USER = os.environ.get("PG_USER", "regime_app")
+PG_PASSWORD = os.environ.get("PG_PASSWORD", "")
 FEATURE_COLUMNS_PATH = ROOT / "models" / "feature_columns.json"
 LOG_DIR = ROOT / "logs"
 LOG_PATH = LOG_DIR / "regime.log"

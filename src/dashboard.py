@@ -14,11 +14,10 @@ Everything else (the intraday chart, full signal history, raw burst log,
 color legend) is tucked into collapsed expanders below -- there if you want
 to dig in, out of the way if you don't.
 
-Reads directly from data/test.db, which realtime_loop.py / intraday_loop.py
-populate entirely from the live MT5 terminal (no static file).
+Reads directly from the live Postgres DB, which realtime_loop.py /
+intraday_loop.py populate entirely from the live MT5 terminal (no static file).
 """
 
-import sqlite3
 import sys
 from pathlib import Path
 
@@ -28,9 +27,10 @@ if str(ROOT) not in sys.path:
 
 import pandas as pd
 import plotly.graph_objects as go
+import psycopg2
 import streamlit as st
 
-from src import config, session_windows
+from src import config, db, session_windows
 from src.labeling import build_labels
 from src.trigger_log import build_reconciliation_log
 
@@ -74,10 +74,11 @@ def get_short_term_status():
     """One combined read of the burst-watch state, reused for the card, the
     action line, and the "recent burst events" expander -- a single query
     instead of three. Returns None if intraday_loop hasn't produced any data yet."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return None
 
-    conn = sqlite3.connect(str(config.DB_PATH))
     last_candle = pd.read_sql_query("SELECT time, close FROM candles_m5 ORDER BY time DESC LIMIT 1", conn)
     alerts = pd.read_sql_query("SELECT * FROM intraday_alerts ORDER BY ts DESC LIMIT 20", conn)
     conn.close()
@@ -125,10 +126,11 @@ def get_short_term_status():
 def load_data():
     """Reads whatever realtime_loop.py has written to data/test.db -- all of it
     sourced live from MT5, nothing from a static file."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    conn = sqlite3.connect(str(config.DB_PATH))
     daily = pd.read_sql_query(
         "SELECT date, open, high, low, close FROM daily_bars ORDER BY date", conn, parse_dates=["date"]
     )
@@ -146,10 +148,11 @@ def load_data():
 @st.cache_data(ttl=15)
 def load_today_intraday():
     """Today's 5-minute candles + today's burst alerts, from data/test.db only."""
-    if not config.DB_PATH.exists():
+    try:
+        conn = db.get_connection()
+    except psycopg2.OperationalError:
         return pd.DataFrame(), pd.DataFrame()
 
-    conn = sqlite3.connect(str(config.DB_PATH))
     m5 = pd.read_sql_query("SELECT time, open, high, low, close FROM candles_m5 ORDER BY time", conn)
     alerts = pd.read_sql_query("SELECT * FROM intraday_alerts ORDER BY ts", conn)
     conn.close()
