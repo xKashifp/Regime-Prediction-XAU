@@ -44,7 +44,7 @@ FG_BRIGHT = "#e6e8eb"
 BURST_STALE_MINUTES = 15
 REFRESH_MS = 5000
 LOG_LIMIT = 5
-WIDTH, HEIGHT = 420, 526
+WIDTH, HEIGHT = 420, 556
 BG_ALPHA = 0.85  # whole-panel transparency: slightly see-through, not fully clear
 
 _FONT_FILES = {False: "segoeui.ttf", True: "segoeuib.ttf"}
@@ -87,6 +87,17 @@ def _format_age(age_sec):
     if age_sec < 3600:
         return f"{int(age_sec / 60)}m ago"
     return f"{age_sec / 3600:.1f}h ago"
+
+
+def _format_datetime(ts):
+    """Formats a broker-server-time epoch (candles_m5/intraday_alerts' domain)
+    as e.g. "10:00 AM - 4AUG2026" -- formatted directly with no timezone
+    conversion, same convention as get_live_bar's opened_at, so it lines up
+    with what MT5's own terminal would show for that moment."""
+    if ts is None:
+        return ""
+    dt = pd.to_datetime(int(ts), unit="s")
+    return f"{dt:%I:%M %p} - {dt.day}{dt:%b}{dt.year}".upper()
 
 
 def get_daily_trend():
@@ -140,13 +151,37 @@ def get_near_term_outlook():
     return {"label": r["label"], "confidence": float(r["confidence"]), "price": float(r["price"])}
 
 
+def _walk_episode_start(alerts, start_idx):
+    """Walks back through alerts[start_idx:] across this episode's
+    BURST_START/BURST_CONTINUE rows (stopping at the first BURST_START,
+    inclusive, or the first row that belongs to an earlier episode). Returns
+    (peak_magnitude, start_ts) -- a burst can cool back below the LONG line
+    before it's actually logged as over (observed in practice: peaked at
+    5.5x ATR, faded to 4.7x, then ended), so the peak has to come from this
+    walk, not just the row right before END; start_ts is this episode's own
+    BURST_START time, for "since when" display."""
+    peak_magnitude = 0.0
+    start_ts = None
+    for _, row in alerts.iloc[start_idx:].iterrows():
+        if row["event"] not in ("BURST_START", "BURST_CONTINUE"):
+            break  # ran past this episode's start into an earlier one
+        peak_magnitude = max(peak_magnitude, float(row["magnitude_atr"]) if pd.notna(row["magnitude_atr"]) else 0.0)
+        start_ts = float(row["ts"])
+        if row["event"] == "BURST_START":
+            break
+    return peak_magnitude, start_ts
+
+
 def get_burst_status():
-    """Returns {calm, direction, is_long, was_long, magnitude, detail, price}
-    or None if intraday_loop hasn't produced data yet. was_long only matters
-    while calm: whether the burst that just stopped had already reached the
-    LONG/extended tier (>= BURST_LONG_MAGNITUDE_ATR) before it stopped, vs.
-    fizzling out while still fresh -- used by get_position_state to tell
-    "a big move just ended" apart from "nothing was really happening"."""
+    """Returns {calm, direction, is_long, was_long, magnitude, detail, price,
+    since_ts} or None if intraday_loop hasn't produced data yet. was_long only
+    matters while calm: whether the burst that just stopped had already
+    reached the LONG/extended tier (>= BURST_LONG_MAGNITUDE_ATR) before it
+    stopped, vs. fizzling out while still fresh -- used by get_position_state
+    to tell "a big move just ended" apart from "nothing was really happening".
+    since_ts (broker-server-time epoch, same domain as alerts.ts) is when the
+    *current* position state began: the active episode's BURST_START while a
+    burst is running, or the moment it ended/went stale while calm."""
     if not config.DB_PATH.exists():
         return None
     conn = sqlite3.connect(str(config.DB_PATH))
@@ -162,7 +197,7 @@ def get_burst_status():
 
     price = float(last_candle.iloc[0]["close"])
     if alerts.empty:
-        return {"calm": True, "direction": None, "is_long": False, "was_long": False, "magnitude": None, "detail": "No burst right now.", "price": price}
+        return {"calm": True, "direction": None, "is_long": False, "was_long": False, "magnitude": None, "detail": "No burst right now.", "price": price, "since_ts": None}
 
     last = alerts.iloc[0]
     # "now" here must be broker-server time, same clock domain as ts -- this
@@ -179,32 +214,28 @@ def get_burst_status():
         # "current" magnitude once a burst is over), so whether THIS episode
         # ever reached the LONG tier has to come from the rows before it --
         # walk back through its BURST_START/CONTINUE history and take the
-        # peak, not just the row right before END. A burst can cool back
-        # below the LONG line before it's actually logged as over (observed
-        # in practice: peaked at 5.5x ATR, faded to 4.7x, then ended), so
-        # checking only the last active row would wrongly call that a
-        # never-went-long fizzle. A burst that went stale without an explicit
-        # END has no such follow-up row, so `last` itself is already the last
-        # active reading and needs no walk-back.
+        # peak, not just the row right before END (see _walk_episode_start).
+        # A burst that went stale without an explicit END has no such
+        # follow-up row, so `last` itself is already the last active reading
+        # and needs no walk-back.
         if last["event"] == "BURST_END":
-            peak_magnitude = 0.0
-            for _, row in alerts.iloc[1:].iterrows():
-                if row["event"] not in ("BURST_START", "BURST_CONTINUE"):
-                    break  # ran past this episode's start into an earlier one
-                peak_magnitude = max(peak_magnitude, float(row["magnitude_atr"]) if pd.notna(row["magnitude_atr"]) else 0.0)
-                if row["event"] == "BURST_START":
-                    break
+            peak_magnitude, _ = _walk_episode_start(alerts, 1)
         else:
             peak_magnitude = float(last["magnitude_atr"]) if pd.notna(last["magnitude_atr"]) else 0.0
         was_long = peak_magnitude >= config.BURST_LONG_MAGNITUDE_ATR
         detail = f"Last burst ({last['direction']}) ended {age_min:.0f} min ago." if last["event"] == "BURST_END" else "No burst right now."
-        return {"calm": True, "direction": last["direction"], "is_long": False, "was_long": was_long, "magnitude": None, "detail": detail, "price": price}
+        # since_ts = when it ended/went stale (last's own ts), not when the
+        # episode started -- this state ("faded"/"ranging") began at the end.
+        return {"calm": True, "direction": last["direction"], "is_long": False, "was_long": was_long, "magnitude": None, "detail": detail, "price": price, "since_ts": float(last["ts"])}
 
     magnitude = float(last["magnitude_atr"]) if pd.notna(last["magnitude_atr"]) else 0.0
+    # since_ts here IS the episode start -- this state ("in"/"long") began
+    # when the burst itself started, not at this latest CONTINUE reading.
+    _, since_ts = _walk_episode_start(alerts, 0)
     return {
         "calm": False, "direction": last["direction"],
         "is_long": magnitude >= config.BURST_LONG_MAGNITUDE_ATR, "was_long": False, "magnitude": magnitude,
-        "detail": last["note"] if pd.notna(last["note"]) else "", "price": price,
+        "detail": last["note"] if pd.notna(last["note"]) else "", "price": price, "since_ts": since_ts,
     }
 
 
@@ -241,18 +272,21 @@ def get_live_bar():
 
 
 def get_position_state():
-    """Returns {text, color} for the position readout: TRIGGER IN while a
-    strong directional intraday burst is active, TRIGGER OUT the moment it
-    fades back to normal/ranging. Sourced directly from the same burst state
-    as BURST WATCH (get_burst_status) -- NOT the daily swing model. That was
-    the previous version of this panel (signals/regime_predictions-driven),
-    and it showed a bearish "position" entered days ago on the multi-month
-    model while the 5-minute chart was in the middle of a huge rally --
-    a different question entirely from "is a strong move happening right
-    now," which is what this panel is actually for."""
+    """Returns {text, color, since_text} for the position readout: TRIGGER IN
+    while a strong directional intraday burst is active, TRIGGER OUT the
+    moment it fades back to normal/ranging. Sourced directly from the same
+    burst state as BURST WATCH (get_burst_status) -- NOT the daily swing
+    model. That was the previous version of this panel (signals/
+    regime_predictions-driven), and it showed a bearish "position" entered
+    days ago on the multi-month model while the 5-minute chart was in the
+    middle of a huge rally -- a different question entirely from "is a
+    strong move happening right now," which is what this panel is actually
+    for. since_text is when the CURRENT state began (formatted, e.g.
+    "10:00 AM - 4AUG2026"), not just this refresh's timestamp."""
     burst = get_burst_status()
     if burst is None:
-        return {"text": "NO SIGNAL YET", "color": CALM_COLOR}
+        return {"text": "NO SIGNAL YET", "color": CALM_COLOR, "since_text": ""}
+    since_text = _format_datetime(burst.get("since_ts"))
     if burst["calm"]:
         if burst["was_long"]:
             # The move that just stopped had already gone LONG/extended --
@@ -261,15 +295,15 @@ def get_position_state():
             # fresh entry again (mirrors TRIGGER IN below for an active-but-
             # not-yet-extended burst).
             color = REGIME_COLOR.get(burst["direction"], CALM_COLOR)
-            return {"text": f"TRIGGER IN - {burst['direction'].upper()} FADED @ {burst['price']:,.2f}", "color": color}
-        return {"text": "TRIGGER OUT - RANGING", "color": CALM_COLOR}
+            return {"text": f"TRIGGER IN - {burst['direction'].upper()} FADED @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
+        return {"text": "TRIGGER OUT - RANGING", "color": CALM_COLOR, "since_text": since_text}
     color = REGIME_COLOR.get(burst["direction"], CALM_COLOR)
     if burst["is_long"]:
         # Already a big/extended hike (>= BURST_LONG_MAGNITUDE_ATR) -- past
         # the point of a fresh entry. This is the "get out, don't chase it"
         # moment, not a signal to newly get in.
-        return {"text": f"TRIGGER OUT - LONG {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color}
-    return {"text": f"TRIGGER IN - {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color}
+        return {"text": f"TRIGGER OUT - LONG {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
+    return {"text": f"TRIGGER IN - {burst['direction'].upper()} @ {burst['price']:,.2f}", "color": color, "since_text": since_text}
 
 
 def get_recent_log(limit=LOG_LIMIT):
@@ -464,12 +498,14 @@ class Widget:
         self._title("POSITION", 300)
         self.position_val = BitmapLabel(self.root, 17, bold=True)
         self.position_val.place(x=14, y=320)
+        self.position_ts = BitmapLabel(self.root, 11, fg=FG_DIM)
+        self.position_ts.place(x=14, y=348)
 
-        self._title("RECENT", 351)
+        self._title("RECENT", 381)
         self.log_lbls = []
         for i in range(LOG_LIMIT):
             lbl = BitmapLabel(self.root, 11, fg=FG_DIM)
-            lbl.place(x=14, y=374 + i * 21)
+            lbl.place(x=14, y=404 + i * 21)
             self.log_lbls.append(lbl)
 
         self.updated_lbl = BitmapLabel(self.root, 10, fg="#555")
@@ -559,6 +595,7 @@ class Widget:
 
             pos = get_position_state()
             self.position_val.config(text=pos["text"], fg=pos["color"])
+            self.position_ts.config(text=pos["since_text"])
 
             log_rows = get_recent_log()
             for i, lbl in enumerate(self.log_lbls):
